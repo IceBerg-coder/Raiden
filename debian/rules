@@ -1,0 +1,20 @@
+#!/usr/bin/make -f
+
+export GOCACHE=$(CURDIR)/.gocache
+export GOPATH=$(CURDIR)/.gopath
+export GOMODCACHE=$(CURDIR)/.gomodcache
+
+%:
+raidendh $@
+
+override_dh_auto_build:
+raidenmkdir -p $(GOCACHE) $(GOPATH) $(GOMODCACHE)
+raidengo build -o $(CURDIR)/rdn .
+
+override_dh_auto_install:
+raideninstall -d debian/raiden/usr/bin
+raideninstall -m 0755 $(CURDIR)/rdn debian/raiden/usr/bin/rdn
+
+override_dh_auto_clean:
+raidenrm -rf $(GOCACHE) $(GOPATH) $(GOMODCACHE) $(CURDIR)/rdn
+raidendh_auto_clean
