@@ -1,0 +1,7 @@
+Package: raiden
+Version: 1.0.0
+Architecture: amd64
+Maintainer: IceBerg-coder <9084minm@psba.edu.sg>
+Description: Blazingly fast parallel downloader for the modern terminal.
+ Raiden (rdn) gets your files in a flash using optimized goroutines.
+ It features smart segmenting, parallel downloading, and a low footprint.
