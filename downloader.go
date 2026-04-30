@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,12 @@ const (
 	DefaultWorkers     = 8
 	MinChunkSize int64 = 1024 * 1024 // 1 MB
 	UserAgent          = "Raiden/1.0"
+	BufferSize         = 256 * 1024      // 256 KB buffer for I/O
+	MaxIdleConns       = 100            // Max idle connections per host
+	MaxConnsPerHost    = 100            // Max connections per host
+	IdleConnTimeout    = 90 * time.Second // Keep-alive timeout
+	HandshakeTimeout   = 10 * time.Second // TLS handshake timeout
+	ExpectContinueTimeout = 1 * time.Second // 100-continue timeout
 )
 
 type Downloader struct {
@@ -86,7 +93,19 @@ func (d *Downloader) Download() error {
 }
 
 func (d *Downloader) getFileInfo() (int64, bool, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	transport := &http.Transport{
+		MaxIdleConns:        MaxIdleConns,
+		MaxConnsPerHost:     MaxConnsPerHost,
+		MaxIdleConnsPerHost: MaxIdleConns,
+		IdleConnTimeout:     IdleConnTimeout,
+		DisableCompression:  true, // We want raw bytes, no compression overhead
+		TLSHandshakeTimeout: HandshakeTimeout,
+		ExpectContinueTimeout: ExpectContinueTimeout,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
 	req, _ := http.NewRequest("HEAD", d.URL, nil)
 	req.Header.Set("User-Agent", UserAgent)
 
@@ -108,7 +127,18 @@ func (d *Downloader) getFileInfo() (int64, bool, error) {
 }
 
 func (d *Downloader) getFileInfoViaGET() (int64, bool, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	transport := &http.Transport{
+		MaxIdleConns:        MaxIdleConns,
+		MaxConnsPerHost:     MaxConnsPerHost,
+		MaxIdleConnsPerHost: MaxIdleConns,
+		IdleConnTimeout:     IdleConnTimeout,
+		DisableCompression:  true,
+		TLSHandshakeTimeout: HandshakeTimeout,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
 	req, _ := http.NewRequest("GET", d.URL, nil)
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Range", "bytes=0-0")
@@ -228,10 +258,21 @@ func (d *Downloader) calculateChunks() []chunk {
 func (d *Downloader) worker(chunkChan <-chan chunk, errChan chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	transport := &http.Transport{
+		MaxIdleConns:        MaxIdleConns,
+		MaxConnsPerHost:     MaxConnsPerHost,
+		MaxIdleConnsPerHost: MaxIdleConns,
+		IdleConnTimeout:     IdleConnTimeout,
+		DisableCompression:  true,
+		TLSHandshakeTimeout: HandshakeTimeout,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
 
 	for c := range chunkChan {
-		tempFile := fmt.Sprintf("%s.part%d", d.getOutputBase(), c.index)
+		tempFile := fmt.Sprintf("%s.part%d", d.OutputFile, c.index)
 		if err := d.downloadChunk(client, c, tempFile); err != nil {
 			errChan <- fmt.Errorf("chunk %d failed: %w", c.index, err)
 			return
@@ -250,6 +291,7 @@ func (d *Downloader) downloadChunk(client *http.Client, c chunk, tempFile string
 	req, _ := http.NewRequest("GET", d.URL, nil)
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", c.start, c.end))
+	req.Header.Set("Connection", "keep-alive")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -267,8 +309,17 @@ func (d *Downloader) downloadChunk(client *http.Client, c chunk, tempFile string
 	}
 	defer out.Close()
 
-	n, err := io.Copy(out, resp.Body)
+	// Use buffered I/O with large buffer for maximum throughput
+	buf := make([]byte, BufferSize)
+	writer := bufio.NewWriterSize(out, BufferSize)
+	reader := bufio.NewReaderSize(resp.Body, BufferSize)
+
+	n, err := io.CopyBuffer(writer, reader, buf)
 	if err != nil {
+		writer.Flush()
+		return err
+	}
+	if err := writer.Flush(); err != nil {
 		return err
 	}
 
@@ -287,9 +338,18 @@ func (d *Downloader) mergeChunks(outputFile string, tempFiles []string) error {
 	defer out.Close()
 
 	for _, tf := range tempFiles {
-		data, err := os.ReadFile(tf)
-		if err != nil {
-			return err
+		// Wait briefly or retry to ensure file isn't locked by OS during concurrent writes
+		var data []byte
+		var readErr error
+		for retries := 0; retries < 3; retries++ {
+			data, readErr = os.ReadFile(tf)
+			if readErr == nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if readErr != nil {
+			return fmt.Errorf("failed to read temp file %s: %w", tf, readErr)
 		}
 		if _, err := out.Write(data); err != nil {
 			return err
@@ -301,9 +361,20 @@ func (d *Downloader) mergeChunks(outputFile string, tempFiles []string) error {
 }
 
 func (d *Downloader) downloadSingle(outputFile string) error {
-	client := &http.Client{Timeout: 30 * time.Second}
+	transport := &http.Transport{
+		MaxIdleConns:        MaxIdleConns,
+		MaxConnsPerHost:     MaxConnsPerHost,
+		IdleConnTimeout:     IdleConnTimeout,
+		DisableCompression:  true,
+		TLSHandshakeTimeout: HandshakeTimeout,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
 	req, _ := http.NewRequest("GET", d.URL, nil)
 	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("Connection", "keep-alive")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -324,8 +395,17 @@ func (d *Downloader) downloadSingle(outputFile string) error {
 	// Progress ticker
 	go d.progressTicker()
 
-	n, err := io.Copy(out, resp.Body)
+	// High throughput buffered copy
+	buf := make([]byte, BufferSize)
+	writer := bufio.NewWriterSize(out, BufferSize)
+	reader := bufio.NewReaderSize(resp.Body, BufferSize)
+
+	n, err := io.CopyBuffer(writer, reader, buf)
 	if err != nil {
+		writer.Flush()
+		return err
+	}
+	if err := writer.Flush(); err != nil {
 		return err
 	}
 
