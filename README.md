@@ -42,6 +42,14 @@ sudo mv rdn /usr/local/bin/
 rdn https://example.com/file.zip
 ```
 
+### Install via Ubuntu PPA
+
+```bash
+sudo add-apt-repository ppa:broodzeus/raiden
+sudo apt update
+sudo apt install raiden
+```
+
 ## How It Works
 
 1. **File Info Check**: Sends a `HEAD` request to determine file size and server capabilities
